@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tennis Score Phase 1</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 520px; margin: 24px auto; padding: 0 16px; }
+    h1 { font-size: 24px; }
+    .score { display: flex; gap: 12px; margin: 18px 0; }
+    .box { flex: 1; border: 1px solid #ddd; border-radius: 8px; padding: 16px; text-align: center; }
+    .num { font-size: 56px; font-weight: 700; }
+    button { width: 100%; margin: 6px 0; padding: 14px; font-size: 18px; border-radius: 8px; border: 1px solid #999; background: #f7f7f7; }
+    .meta { margin-top: 14px; color: #444; line-height: 1.6; }
+  </style>
+</head>
+<body>
+  <h1>Tennis Score Phase 1</h1>
+  <div class="score">
+    <div class="box">Player A<div id="a" class="num">0</div></div>
+    <div class="box">Player B<div id="b" class="num">0</div></div>
+  </div>
+  <button onclick="send({type:'inc', player:'a'})">Player A +1</button>
+  <button onclick="send({type:'inc', player:'b'})">Player B +1</button>
+  <button onclick="send({type:'reset'})">Reset</button>
+  <button onclick="ping()">Ping</button>
+  <div class="meta">
+    Status: <b id="status">connecting</b><br>
+    Server pod: <span id="pod">?</span><br>
+    Server IP: <span id="podIp">?</span><br>
+    Redis: <span id="redis">?</span><br>
+    Connected clients: <span id="clients">?</span><br>
+    Latency: <span id="latency">?</span>
+  </div>
+  <script>
+    let ws, pingStart = 0, pingId = 0;
+    const el = (id) => document.getElementById(id);
+
+    function connect() {
+      fetch("/api/info").then(r => r.json()).then(x => {
+        el("pod").textContent = x.pod;
+        el("podIp").textContent = x.podIp;
+        el("redis").textContent = x.redis ? "connected" : "off";
+      }).catch(() => {});
+      ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}`);
+      ws.onopen = () => el("status").textContent = "connected";
+      ws.onclose = () => {
+        el("status").textContent = "disconnected; retrying";
+        setTimeout(connect, 1000);
+      };
+      ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        if (msg.type === "score") {
+          el("a").textContent = msg.state.a;
+          el("b").textContent = msg.state.b;
+          if (msg.pod) el("pod").textContent = msg.pod;
+          if (msg.podIp) el("podIp").textContent = msg.podIp;
+        }
+        if (msg.type === "clients") el("clients").textContent = msg.count;
+        if (msg.type === "pong" && msg.id === pingId) el("latency").textContent = `${Date.now() - pingStart} ms`;
+      };
+    }
+
+    function send(msg) {
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+    }
+
+    function ping() {
+      pingStart = Date.now();
+      pingId += 1;
+      send({ type: "ping", id: pingId });
+    }
+
+    connect();
+  </script>
+</body>
+</html>
