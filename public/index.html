@@ -3,72 +3,263 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Tennis Score Phase 1</title>
+  <title>Tennis Event Prototype</title>
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 520px; margin: 24px auto; padding: 0 16px; }
-    h1 { font-size: 24px; }
-    .score { display: flex; gap: 12px; margin: 18px 0; }
-    .box { flex: 1; border: 1px solid #ddd; border-radius: 8px; padding: 16px; text-align: center; }
-    .num { font-size: 56px; font-weight: 700; }
-    button { width: 100%; margin: 6px 0; padding: 14px; font-size: 18px; border-radius: 8px; border: 1px solid #999; background: #f7f7f7; }
-    .meta { margin-top: 14px; color: #444; line-height: 1.6; }
+    body { font-family: system-ui, sans-serif; max-width: 620px; margin: 16px auto; padding: 0 12px; }
+    h1 { font-size: 22px; margin-bottom: 8px; }
+    .score, .row { display: flex; gap: 8px; }
+    .box { flex: 1; border: 1px solid #ddd; border-radius: 8px; padding: 12px; text-align: center; }
+    .num { font-size: 44px; font-weight: 700; }
+    button, select { width: 100%; margin: 4px 0; padding: 11px; font-size: 16px; border-radius: 8px; border: 1px solid #999; background: #f7f7f7; }
+    video, canvas { width: 100%; border-radius: 8px; background: #111; }
+    .stage { position: relative; margin: 8px 0; }
+    #overlay { position: absolute; left: 0; top: 0; }
+    .meta { color: #444; line-height: 1.55; font-size: 14px; }
+    .pill { display: inline-block; min-width: 64px; font-variant-numeric: tabular-nums; }
   </style>
+  <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
 </head>
 <body>
-  <h1>Tennis Score Phase 1</h1>
+  <h1>Tennis Event Prototype</h1>
   <div class="score">
     <div class="box">Player A<div id="a" class="num">0</div></div>
     <div class="box">Player B<div id="b" class="num">0</div></div>
   </div>
-  <button onclick="send({type:'inc', player:'a'})">Player A +1</button>
-  <button onclick="send({type:'inc', player:'b'})">Player B +1</button>
-  <button onclick="send({type:'reset'})">Reset</button>
-  <button onclick="ping()">Ping</button>
-  <div class="meta">
-    Status: <b id="status">connecting</b><br>
-    Server pod: <span id="pod">?</span><br>
-    Server IP: <span id="podIp">?</span><br>
-    Redis: <span id="redis">?</span><br>
-    Connected clients: <span id="clients">?</span><br>
-    Latency: <span id="latency">?</span>
+
+  <div class="row">
+    <button onclick="send({type:'inc', player:'a'})">A +1</button>
+    <button onclick="send({type:'inc', player:'b'})">B +1</button>
+    <button onclick="send({type:'reset'})">Reset</button>
+    <button onclick="ping()">Ping</button>
   </div>
+
+  <div class="row">
+    <select id="cameraId" onchange="registerCamera()">
+      <option value="cameraA">Camera A</option>
+      <option value="cameraB">Camera B</option>
+    </select>
+    <button onclick="toggleCamera()">Start/Stop Camera</button>
+  </div>
+
+  <div class="stage">
+    <video id="video" playsinline muted></video>
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <div class="row">
+    <button onclick="startCalibration()">Manual Calibrate</button>
+    <button onclick="autoLines()">Auto Lines</button>
+    <button onclick="sendHit('a')">Player A hit</button>
+    <button onclick="sendHit('b')">Player B hit</button>
+  </div>
+  <button onclick="send({type:'newRally'})">New Rally</button>
+
+  <div class="row">
+    <button onclick="simulate('insideBounce')">Sim inside bounce</button>
+    <button onclick="simulate('outsideBounce')">Sim outside</button>
+    <button onclick="simulate('netFault')">Sim net fault</button>
+  </div>
+  <div class="row">
+    <button onclick="simulate('crossing')">Sim crossing</button>
+    <button onclick="simulate('doubleBounce')">Sim double bounce</button>
+    <button onclick="simulate('ambiguous')">Sim ambiguous</button>
+  </div>
+
+  <div class="meta">
+    Status: <b id="status">connecting</b> |
+    Clients: <span id="clients">?</span> |
+    Latency: <span id="latency">?</span><br>
+    Pod: <span id="pod">?</span> / <span id="podIp">?</span> |
+    Redis: <span id="redis">?</span><br>
+    Event: <b id="event">none</b> |
+    Side: <span id="side" class="pill">UNKNOWN</span> |
+    Confidence: <span id="conf" class="pill">0</span><br>
+    State score: <span id="stateScore" class="pill">0</span> |
+    Kalman score: <span id="kalmanScore" class="pill">0</span> |
+    Calibration: <span id="calib">none</span>
+  </div>
+
   <script>
-    let ws, pingStart = 0, pingId = 0;
+    let ws, pingStart = 0, pingId = 0, stream, raf, frameId = 0, lastSent = 0;
+    let calibrating = false, corners = [], H = null, lastFrame = null, hist = [], kf = null;
+    const video = document.getElementById("video");
+    const canvas = document.getElementById("overlay");
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
     const el = (id) => document.getElementById(id);
+    const cam = () => el("cameraId").value;
+    // TUNE LATER: phone/court lighting will change these thresholds.
+    const TH = { state: 0.65, kalman: 0.65, conf: 0.45, sendMs: 40, minArea: 18, maxArea: 900 };
 
     function connect() {
       fetch("/api/info").then(r => r.json()).then(x => {
-        el("pod").textContent = x.pod;
-        el("podIp").textContent = x.podIp;
+        el("pod").textContent = x.pod; el("podIp").textContent = x.podIp;
         el("redis").textContent = x.redis ? "connected" : "off";
       }).catch(() => {});
       ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}`);
-      ws.onopen = () => el("status").textContent = "connected";
-      ws.onclose = () => {
-        el("status").textContent = "disconnected; retrying";
-        setTimeout(connect, 1000);
-      };
+      ws.onopen = () => { el("status").textContent = "connected"; registerCamera(); };
+      ws.onclose = () => { el("status").textContent = "disconnected; retrying"; setTimeout(connect, 1000); };
       ws.onmessage = (event) => {
         const msg = JSON.parse(event.data);
-        if (msg.type === "score") {
-          el("a").textContent = msg.state.a;
-          el("b").textContent = msg.state.b;
-          if (msg.pod) el("pod").textContent = msg.pod;
-          if (msg.podIp) el("podIp").textContent = msg.podIp;
-        }
+        if (msg.type === "score") { el("a").textContent = msg.state.a; el("b").textContent = msg.state.b; }
         if (msg.type === "clients") el("clients").textContent = msg.count;
         if (msg.type === "pong" && msg.id === pingId) el("latency").textContent = `${Date.now() - pingStart} ms`;
+        if (msg.type === "rallyEvent") el("event").textContent = `${msg.event} -> ${msg.winner || ""} (${msg.source})`;
       };
     }
+    function send(msg) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg)); }
+    function ping() { pingStart = Date.now(); pingId += 1; send({ type: "ping", id: pingId }); }
+    function registerCamera() { send({ type: "registerCamera", cameraId: cam() }); loadCalibration(); }
+    function sendHit(player) { send({ type: "hit", player, captureTime: Date.now() }); }
 
-    function send(msg) {
-      if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+    async function toggleCamera() {
+      if (stream) {
+        stream.getTracks().forEach(t => t.stop()); stream = null; cancelAnimationFrame(raf); return;
+      }
+      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false });
+      video.srcObject = stream; await video.play();
+      canvas.width = video.videoWidth || 640; canvas.height = video.videoHeight || 480;
+      loop();
     }
 
-    function ping() {
-      pingStart = Date.now();
-      pingId += 1;
-      send({ type: "ping", id: pingId });
+    function startCalibration() {
+      calibrating = true; corners = []; H = null; el("calib").textContent = "tap 4 court corners";
+      draw();
+    }
+    canvas.onclick = (e) => {
+      if (!calibrating) return;
+      const r = canvas.getBoundingClientRect();
+      corners.push([(e.clientX - r.left) * canvas.width / r.width, (e.clientY - r.top) * canvas.height / r.height]);
+      if (corners.length === 4) {
+        H = homography(corners, [[0,0],[100,0],[100,100],[0,100]]);
+        localStorage.setItem(`calib:${cam()}`, JSON.stringify({ corners, H }));
+        calibrating = false; el("calib").textContent = "manual saved";
+        send({ type: "calibrationStatus", cameraId: cam(), valid: true });
+      }
+      draw();
+    };
+    function loadCalibration() {
+      const saved = localStorage.getItem(`calib:${cam()}`);
+      if (!saved) { el("calib").textContent = "none"; return; }
+      ({ corners, H } = JSON.parse(saved)); el("calib").textContent = "saved";
+      send({ type: "calibrationStatus", cameraId: cam(), valid: true });
+    }
+
+    function autoLines() {
+      draw();
+      if (!window.cv || !video.videoWidth) { el("calib").textContent = "OpenCV not ready; use manual"; return; }
+      const src = cv.imread(canvas), gray = new cv.Mat(), edges = new cv.Mat(), lines = new cv.Mat();
+      cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY); cv.GaussianBlur(gray, gray, new cv.Size(5,5), 0);
+      cv.Canny(gray, edges, 60, 140); cv.HoughLinesP(edges, lines, 1, Math.PI / 180, 60, 40, 12);
+      ctx.strokeStyle = "#0ff"; ctx.lineWidth = 2;
+      for (let i = 0; i < Math.min(lines.rows, 24); i++) {
+        const p = lines.data32S.slice(i * 4, i * 4 + 4); ctx.beginPath(); ctx.moveTo(p[0], p[1]); ctx.lineTo(p[2], p[3]); ctx.stroke();
+      }
+      src.delete(); gray.delete(); edges.delete(); lines.delete(); el("calib").textContent = "auto lines overlay; tap corners if needed";
+    }
+
+    function loop(t = performance.now()) {
+      if (!stream) return;
+      draw();
+      const obs = detectBall(t);
+      if (obs && t - lastSent > TH.sendMs) { lastSent = t; send(obs); }
+      raf = requestAnimationFrame(loop);
+    }
+    function draw() {
+      if (!video.videoWidth) return;
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      if (corners.length) {
+        ctx.strokeStyle = "#39f"; ctx.fillStyle = "#39f"; ctx.lineWidth = 2; ctx.beginPath();
+        corners.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]));
+        if (corners.length === 4) ctx.closePath(); ctx.stroke();
+        corners.forEach(p => ctx.fillRect(p[0] - 4, p[1] - 4, 8, 8));
+      }
+    }
+    function detectBall(t) {
+      const img = ctx.getImageData(0, 0, canvas.width, canvas.height), d = img.data;
+      let sx = 0, sy = 0, n = 0, minX = 1e9, minY = 1e9, maxX = 0, maxY = 0;
+      for (let y = 0; y < canvas.height; y += 3) for (let x = 0; x < canvas.width; x += 3) {
+        const i = (y * canvas.width + x) * 4, r = d[i], g = d[i+1], b = d[i+2];
+        const motion = lastFrame ? Math.abs(r-lastFrame[i]) + Math.abs(g-lastFrame[i+1]) + Math.abs(b-lastFrame[i+2]) : 0;
+        const ballish = (r + g + b > 430 && motion > 45) || (g > 115 && r > 95 && b < 120 && motion > 35);
+        if (!ballish) continue;
+        sx += x; sy += y; n++; minX = Math.min(minX, x); minY = Math.min(minY, y); maxX = Math.max(maxX, x); maxY = Math.max(maxY, y);
+      }
+      lastFrame = new Uint8ClampedArray(d);
+      if (n < 2) return maybeInvisible();
+      const ball = { visible: true, x: sx/n, y: sy/n, width: maxX-minX+3, height: maxY-minY+3, area: n*9, confidence: Math.min(1, n / 80) };
+      if (ball.area < TH.minArea || ball.area > TH.maxArea) return maybeInvisible();
+      const prev = hist.at(-1), dt = prev ? Math.max(16, t - prev.t) / 16.7 : 1;
+      ball.vx = prev ? (ball.x - prev.x) / dt : 0; ball.vy = prev ? (ball.y - prev.y) / dt : 0;
+      const stateChangeScore = stateScore(ball, prev);
+      const kalmanEventScore = kalmanScore(ball);
+      const court = classify(ball.x, ball.y);
+      const candidate = stateChangeScore > TH.state && kalmanEventScore > TH.kalman ? (court.side === "NET" ? "net" : "bounce") : null;
+      hist.push({ ...ball, t, stateChangeScore, kalmanEventScore }); hist = hist.slice(-20);
+      ctx.strokeStyle = candidate ? "#f33" : "#0f0"; ctx.lineWidth = 3; ctx.strokeRect(minX, minY, ball.width, ball.height);
+      updateDebug(court, ball.confidence, stateChangeScore, kalmanEventScore);
+      return observation(ball, court, { stateChangeScore, kalmanEventScore }, candidate);
+    }
+    function maybeInvisible() { return Math.random() < 0.03 ? observation({ visible: false }, { side: "UNKNOWN", inside: false }, {}, null) : null; }
+    function stateScore(b, p) {
+      if (!p) return 0;
+      const dv = Math.hypot(b.vx - p.vx, b.vy - p.vy) / 45;
+      const turn = Math.abs(Math.atan2(b.vy, b.vx) - Math.atan2(p.vy, p.vx)) / Math.PI;
+      const slow = Math.max(0, Math.hypot(p.vx,p.vy) - Math.hypot(b.vx,b.vy)) / 35;
+      const shape = Math.abs(b.area - p.area) / Math.max(1, p.area) / 2;
+      return Math.min(1, dv * 0.45 + turn * 0.3 + slow * 0.2 + shape * 0.05);
+    }
+    function kalmanScore(b) {
+      if (!kf) { kf = { x: b.x, y: b.y, vx: 0, vy: 0 }; return 0; }
+      const px = kf.x + kf.vx, py = kf.y + kf.vy, residual = Math.hypot(b.x - px, b.y - py);
+      kf.vx = 0.75 * kf.vx + 0.25 * (b.x - kf.x); kf.vy = 0.75 * kf.vy + 0.25 * (b.y - kf.y);
+      kf.x = 0.55 * px + 0.45 * b.x; kf.y = 0.55 * py + 0.45 * b.y;
+      return Math.min(1, residual / 80);
+    }
+    function classify(x, y) {
+      const p = H ? project(H, [x, y]) : [100 * x / canvas.width, 100 * y / canvas.height];
+      const inside = p[0] >= 0 && p[0] <= 100 && p[1] >= 0 && p[1] <= 100;
+      const side = Math.abs(p[1] - 50) < 8 ? "NET" : (p[1] < 50 ? "A" : "B");
+      return { side: inside ? side : (side === "NET" ? "NET" : side), inside, nearNet: Math.abs(p[1] - 50) < 10 };
+    }
+    function observation(ball, court, metrics, candidate) {
+      return { type: "observation", cameraId: cam(), frameId: ++frameId, captureTime: Date.now(), ball, court, metrics, candidate };
+    }
+    function updateDebug(court, conf, s, k) {
+      el("side").textContent = court.side; el("conf").textContent = conf.toFixed(2);
+      el("stateScore").textContent = s.toFixed(2); el("kalmanScore").textContent = k.toFixed(2);
+    }
+
+    function simulate(kind) {
+      const now = Date.now(), base = { cameraId: cam(), captureTime: now, ball: { visible: true, x: 300, y: 240, vx: 8, vy: -5, area: 90, confidence: 0.9 }, metrics: { stateChangeScore: 0.9, kalmanEventScore: 0.9 }, candidate: "bounce" };
+      if (kind === "insideBounce") send({ type: "observation", ...base, court: { side: "B", inside: true } });
+      if (kind === "outsideBounce") { sendHit("a"); setTimeout(() => send({ type: "observation", ...base, court: { side: "B", inside: false } }), 80); }
+      if (kind === "netFault") { sendHit("a"); setTimeout(() => send({ type: "observation", ...base, candidate: "net", court: { side: "NET", inside: true, nearNet: true } }), 80); }
+      if (kind === "crossing") { sendHit("a"); ["A","NET","B"].forEach((side, i) => setTimeout(() => send({ type: "observation", ...base, captureTime: now+i*80, candidate: null, court: { side, inside: true } }), i*90)); }
+      if (kind === "doubleBounce") { send({ type: "newRally" }); setTimeout(() => send({ type: "observation", ...base, court: { side: "A", inside: true } }), 80); setTimeout(() => send({ type: "observation", ...base, captureTime: now+700, court: { side: "A", inside: true } }), 780); }
+      if (kind === "ambiguous") send({ type: "observation", ...base, metrics: { stateChangeScore: 0.4, kalmanEventScore: 0.9 }, court: { side: "UNKNOWN", inside: false }, candidate: "bounce" });
+    }
+
+    function homography(src, dst) {
+      const A = [], b = [];
+      for (let i = 0; i < 4; i++) {
+        const [x,y] = src[i], [u,v] = dst[i];
+        A.push([x,y,1,0,0,0,-u*x,-u*y]); b.push(u);
+        A.push([0,0,0,x,y,1,-v*x,-v*y]); b.push(v);
+      }
+      const h = solve(A, b); return [...h, 1];
+    }
+    function solve(A, b) {
+      for (let i = 0; i < b.length; i++) {
+        let max = i; for (let r = i+1; r < b.length; r++) if (Math.abs(A[r][i]) > Math.abs(A[max][i])) max = r;
+        [A[i], A[max]] = [A[max], A[i]]; [b[i], b[max]] = [b[max], b[i]];
+        const div = A[i][i] || 1e-9; for (let c = i; c < b.length; c++) A[i][c] /= div; b[i] /= div;
+        for (let r = 0; r < b.length; r++) if (r !== i) { const f = A[r][i]; for (let c = i; c < b.length; c++) A[r][c] -= f*A[i][c]; b[r] -= f*b[i]; }
+      }
+      return b;
+    }
+    function project(h, p) {
+      const [x,y] = p, z = h[6]*x + h[7]*y + h[8];
+      return [(h[0]*x + h[1]*y + h[2]) / z, (h[3]*x + h[4]*y + h[5]) / z];
     }
 
     connect();
