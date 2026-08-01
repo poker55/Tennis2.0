@@ -140,3 +140,31 @@ Phase 2 to-do list:
 - Improve tracking continuity with Kalman prediction, speed constraints, and candidate selection near the predicted ball path.
 - Revisit bounce detection only after ball tracking is stable enough across several exchanges.
 
+## Phase 3: Product Direction and Architecture Split
+
+Phase 3 records the current improvement in ball detection and the likely direction for separating the project into two related solutions.
+
+The one-camera detection prototype improved after switching the ball detector from the classical background-subtraction approach to a YOLO-based tennis-ball detector. The current detector uses YOLO to propose possible tennis-ball boxes, then rejects bad detections using extra filters:
+
+- Maximum bounding-box width/height with `--yolo-max-box`
+- Maximum bounding-box area with `--yolo-max-area`
+- HSV tennis-ball color checks inside the detected box
+- Rejection of patches that are too bright, too pale, or contain too little yellow/green tennis-ball color
+
+This helped reduce false positives from lights while keeping real tennis-ball detections. The current working idea is that the one-camera version may need a heavier algorithmic pipeline, including YOLO, tracking, calibration, bounce detection, and score/event logic.
+
+Future work may split the project into two solutions:
+
+1. One-camera algorithm-heavy court scoring
+
+   This solution would use one fixed camera to detect tennis-ball movement, court position, bounces, in/out decisions, and score events. It may use heavier local computer-vision tools such as YOLO and tracking logic. The goal would be automatic scoring from court video with minimal manual input.
+
+2. Low-data multi-device scoring app
+
+   This solution would focus on online score synchronization with very low data transfer. It would keep the existing web/app direction: Kubernetes scaling plan, Redis memory/state sync, WebSocket communication, and multi-device support. Supported devices could include phones, tablets, and watches.
+
+A possible two-camera structure should also be explored. Two cameras may reduce ambiguity in ball location, bounces, occlusion, and court-side interpretation, but it creates new practical questions around setup, synchronization, and communication.
+
+Open technical question:
+
+The main issue for the multi-device and possible two-camera direction is the communication protocol. Options include Wi-Fi, Bluetooth, local network, and internet-based sync. It would be wise to research what current successful tennis/scoring apps use, because the protocol choice will strongly affect reliability, latency, setup difficulty, and success rate in real court environments.
