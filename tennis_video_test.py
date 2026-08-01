@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Compact OpenCV prototype for single fixed-camera tennis bounce testing.
+Single fixed-camera tennis bounce testing prototype.
 
-This intentionally stays classical: no ML models, no cloud calls, no uploads.
+Default ball detection uses a local YOLO/Ultralytics tennis-ball model.
+The older classical OpenCV detector is kept as a comparison mode.
 Thresholds are experimental/tunable and meant to be adjusted against real clips.
 """
 
@@ -203,7 +204,102 @@ def make_kalman(x, y):
     return kf
 
 
-def detect_ball(frame, fgmask, prev):
+def empty_ball():
+    return {"visible": False, "x": "", "y": "", "width": "", "height": "", "area": "", "confidence": 0.0, "bbox": None}
+
+
+def previous_xy(prev):
+    if prev is None:
+        return None
+    return np.array([prev["x"], prev["y"]], dtype=np.float32)
+
+
+def load_yolo_model(model_ref):
+    try:
+        from ultralytics import YOLO
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("Missing YOLO dependency. Install with: python3 -m pip install ultralytics huggingface_hub") from exc
+
+    if os.path.exists(model_ref):
+        return YOLO(model_ref)
+
+    try:
+        return YOLO(model_ref)
+    except Exception as direct_exc:
+        try:
+            from huggingface_hub import hf_hub_download, list_repo_files
+        except ModuleNotFoundError as exc:
+            raise RuntimeError("Install huggingface_hub or pass a local YOLO .pt/.onnx file with --yolo-model") from exc
+
+        candidates = [name for name in list_repo_files(model_ref) if name.endswith((".pt", ".onnx"))]
+        if not candidates:
+            raise RuntimeError(f"No YOLO .pt/.onnx weights found in Hugging Face repo: {model_ref}") from direct_exc
+        preferred = sorted(candidates, key=lambda n: ("best" not in n.lower(), "tennis" not in n.lower(), len(n)))[0]
+        local_model = hf_hub_download(repo_id=model_ref, filename=preferred)
+        return YOLO(local_model)
+
+
+def tennis_color_score(frame, x1, y1, x2, y2):
+    patch = frame[max(0, int(y1)) : max(0, int(y2)), max(0, int(x1)) : max(0, int(x2))]
+    if patch.size == 0:
+        return 0.0, 0.0, 0.0
+    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+    color = cv2.inRange(hsv, np.array([22, 45, 70]), np.array([78, 255, 255]))
+    color_ratio = float(cv2.countNonZero(color)) / float(max(1, patch.shape[0] * patch.shape[1]))
+    mean_s = float(cv2.mean(hsv[:, :, 1])[0])
+    mean_v = float(cv2.mean(hsv[:, :, 2])[0])
+    return color_ratio, mean_s, mean_v
+
+
+def detect_ball_yolo(frame, prev, model, conf_threshold=0.18, device=None, max_box_px=40.0, max_area_px=1200.0):
+    kwargs = {"conf": conf_threshold, "verbose": False}
+    if device:
+        kwargs["device"] = device
+    results = model.predict(frame, **kwargs)
+    if not results or results[0].boxes is None or len(results[0].boxes) == 0:
+        return empty_ball()
+
+    best = None
+    best_score = -1.0
+    prev_pos = previous_xy(prev)
+    h, w = frame.shape[:2]
+
+    for box in results[0].boxes:
+        x1, y1, x2, y2 = [float(v) for v in box.xyxy[0].tolist()]
+        bw = max(0.0, x2 - x1)
+        bh = max(0.0, y2 - y1)
+        area = bw * bh
+        if bw < 2 or bh < 2 or bw > max_box_px or bh > max_box_px or area > max_area_px:
+            continue
+        color_ratio, mean_s, mean_v = tennis_color_score(frame, x1, y1, x2, y2)
+        # Experimental/tunable: reject large bright lamps and pale highlights.
+        if mean_v > 245 or mean_s < 35 or color_ratio < 0.08:
+            continue
+        cx, cy = x1 + bw / 2.0, y1 + bh / 2.0
+        model_conf = float(box.conf[0]) if box.conf is not None else conf_threshold
+        dist_score = 0.5
+        if prev_pos is not None:
+            dist = float(np.linalg.norm(np.array([cx, cy]) - prev_pos))
+            dist_score = 1.0 - clamp01(dist / 180.0)
+        size_score = 1.0 - clamp01(abs((bw + bh) / 2.0 - 14.0) / 70.0)
+        score = 0.70 * clamp01(model_conf) + 0.20 * dist_score + 0.10 * size_score
+        if score > best_score:
+            best_score = score
+            best = {
+                "visible": True,
+                "x": float(cx),
+                "y": float(cy),
+                "width": float(bw),
+                "height": float(bh),
+                "area": float(area),
+                "confidence": clamp01(score),
+                "bbox": (int(x1), int(y1), int(bw), int(bh)),
+            }
+
+    return best if best is not None else empty_ball()
+
+
+def detect_ball_classical(frame, fgmask, prev):
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     # Require tennis-ball color inside moving regions: static graphics and dark
     # moving shadows should not become ball candidates.
@@ -217,7 +313,7 @@ def detect_ball(frame, fgmask, prev):
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     best = None
     best_score = -1.0
-    prev_xy = None if prev is None else np.array([prev["x"], prev["y"]], dtype=np.float32)
+    prev_pos = previous_xy(prev)
     h, w = frame.shape[:2]
 
     for c in contours:
@@ -237,8 +333,8 @@ def detect_ball(frame, fgmask, prev):
             continue
         cx, cy = x + bw / 2.0, y + bh / 2.0
         dist_score = 0.35
-        if prev_xy is not None:
-            dist = float(np.linalg.norm(np.array([cx, cy]) - prev_xy))
+        if prev_pos is not None:
+            dist = float(np.linalg.norm(np.array([cx, cy]) - prev_pos))
             dist_score = 1.0 - clamp01(dist / 140.0)
         size_score = 1.0 - clamp01(abs((bw + bh) / 2.0 - 18.0) / 50.0)
         circ_score = clamp01(circularity)
@@ -258,9 +354,7 @@ def detect_ball(frame, fgmask, prev):
                 "bbox": (int(x), int(y), int(bw), int(bh)),
             }
 
-    if best is None:
-        return {"visible": False, "x": "", "y": "", "width": "", "height": "", "area": "", "confidence": 0.0, "bbox": None}
-    return best
+    return best if best is not None else empty_ball()
 
 
 def enrich_state(obs, history):
@@ -369,6 +463,7 @@ def process_video(args):
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     writer = cv2.VideoWriter(args.out, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
     bg = cv2.createBackgroundSubtractorMOG2(history=220, varThreshold=24, detectShadows=True)
+    yolo_model = load_yolo_model(args.yolo_model) if args.detector == "yolo" else None
 
     history = deque(maxlen=HISTORY_LEN)
     recent_scores = deque(maxlen=MATCH_WINDOW)
@@ -413,7 +508,18 @@ def process_video(args):
             time_ms = int(1000.0 * frame_id / fps)
             fgmask = bg.apply(frame)
             prev_visible = next((h for h in reversed(history) if h["visible"]), None)
-            obs = detect_ball(frame, fgmask, prev_visible)
+            if args.detector == "yolo":
+                obs = detect_ball_yolo(
+                    frame,
+                    prev_visible,
+                    yolo_model,
+                    args.yolo_conf,
+                    args.yolo_device,
+                    args.yolo_max_box,
+                    args.yolo_max_area,
+                )
+            else:
+                obs = detect_ball_classical(frame, fgmask, prev_visible)
             state = enrich_state(obs, history)
 
             predicted = None
@@ -527,11 +633,17 @@ def process_video(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Classical OpenCV tennis-ball bounce/in-out prototype.")
+    parser = argparse.ArgumentParser(description="One-camera tennis-ball bounce/in-out prototype.")
     parser.add_argument("--video", required=True, help="Input local video path")
     parser.add_argument("--calibration", default="calibration.json", help="Saved/manual calibration JSON")
     parser.add_argument("--out", default="debug.mp4", help="Debug overlay video path")
     parser.add_argument("--csv", default="measurements.csv", help="Per-frame measurements CSV")
+    parser.add_argument("--detector", choices=("yolo", "classical"), default="yolo", help="Ball detector to use")
+    parser.add_argument("--yolo-model", default="RJTPP/tennis-ball-detection", help="Local YOLO weights path or Hugging Face repo id")
+    parser.add_argument("--yolo-conf", type=float, default=0.18, help="YOLO confidence threshold")
+    parser.add_argument("--yolo-device", default=None, help="Optional Ultralytics device, e.g. cpu, mps, 0")
+    parser.add_argument("--yolo-max-box", type=float, default=40.0, help="Reject YOLO boxes wider or taller than this many pixels")
+    parser.add_argument("--yolo-max-area", type=float, default=1200.0, help="Reject YOLO boxes with area larger than this many pixels")
     return parser.parse_args()
 
 
